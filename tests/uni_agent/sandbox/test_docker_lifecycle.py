@@ -51,6 +51,51 @@ def test_docker_cli_is_killed_and_reaped_on_interrupt(monkeypatch, interrupt):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("cleanup_recovers", [True, False])
+def test_restart_retries_pending_cleanup_before_allocating_container(monkeypatch, cleanup_recovers):
+    sandbox = DockerSandbox()
+    calls = []
+    removal_fails = True
+
+    async def fake_run(*args, timeout=None):
+        calls.append(args)
+        if args[0] == "container":
+            return ok("owned-id\n")
+        if args[0] == "rm" and removal_fails:
+            return ExecResult(1, "", "daemon unavailable")
+        return ok()
+
+    monkeypatch.setattr(sandbox, "_run_docker", fake_run)
+
+    async def run():
+        nonlocal removal_fails
+        await sandbox.start()
+        previous_owner = sandbox._cleanup_label
+        with pytest.raises(RuntimeError, match="daemon unavailable"):
+            await sandbox.stop()
+        assert sandbox._container_name is None
+        assert sandbox._cleanup_label == previous_owner
+
+        calls.clear()
+        removal_fails = not cleanup_recovers
+        if cleanup_recovers:
+            await sandbox.start()
+            assert [call[0] for call in calls] == ["container", "rm", "run"]
+            assert sandbox._container_name is not None
+            assert sandbox._cleanup_label is not None
+            assert sandbox._cleanup_label != previous_owner
+        else:
+            with pytest.raises(RuntimeError, match="daemon unavailable"):
+                await sandbox.start()
+            assert [call[0] for call in calls] == ["container", "rm"]
+            assert sandbox._container_name is None
+            assert sandbox._cleanup_label == previous_owner
+        assert calls[0][-1] == f"label={previous_owner}"
+        assert calls[1] == ("rm", "-f", "owned-id")
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("failure", ["cancel", "outer_timeout", "nonzero"])
 def test_interrupted_start_removes_only_owned_container(monkeypatch, failure):
     sandbox = DockerSandbox(container_name="possibly-shared-name")
